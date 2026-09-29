@@ -33,6 +33,8 @@ import type { FromWebview } from './protocol';
 import type { CodexAccountStore } from './codex/codexStore';
 import { runTool, type ToolDeps } from './tools';
 import { t } from './i18n';
+import { isWindows } from './platform';
+import { askCopyFallback } from './linkPolicy';
 
 export interface Deps {
   store: AccountStore;
@@ -140,10 +142,12 @@ export function registerCommands(deps: Deps): vscode.Disposable[] {
     } catch (err) {
       return t('account.createDirFailed', { error: errText(err) });
     }
+    // Windows without file-link privilege: ask before anything is linked or copied
+    const linkOptions = shared ? await askCopyFallback(account.dir, 'Claude') : {};
     // Linking or copying failures only warn and do not block
     try {
       if (shared) {
-        const report = ensureClaudeLinks(account.dir);
+        const report = ensureClaudeLinks(account.dir, '/proc', linkOptions);
         mirrorClaudeJson(defaultJson(), account.dir);
         const notes = describeShareReport(report);
         if (notes) void vscode.window.showWarningMessage(t('share.addNotes', { name, notes }));
@@ -183,8 +187,9 @@ export function registerCommands(deps: Deps): vscode.Disposable[] {
       void vscode.window.showWarningMessage(t('share.busy', { name: labelOf(account) }));
       return;
     }
+    const linkOptions = await askCopyFallback(account.dir, 'Claude');
     try {
-      const report = migrateClaudeToShared(account.dir, account.name, procRoot, labelOf(account));
+      const report = migrateClaudeToShared(account.dir, account.name, procRoot, labelOf(account), linkOptions);
       mirrorClaudeJson(defaultJson(), account.dir);
       void vscode.window.showInformationMessage(t('share.done', { label: labelOf(account), summary: describeShareReport(report) || t('share.nothingElse') }));
     } catch (err) {
@@ -268,7 +273,8 @@ export function registerCommands(deps: Deps): vscode.Disposable[] {
       env: isDefault ? undefined : { CLAUDE_CONFIG_DIR: account.dir },
     });
     terminals.set(terminal, account);
-    terminal.sendText(isDefault ? 'claude' : `env CLAUDE_CONFIG_DIR=${shQuote(account.dir)} claude`);
+    // The terminal environment carries CLAUDE_CONFIG_DIR; Windows shells have no `env` command
+    terminal.sendText(isDefault || isWindows() ? 'claude' : `env CLAUDE_CONFIG_DIR=${shQuote(account.dir)} claude`);
     terminal.show();
   }
 

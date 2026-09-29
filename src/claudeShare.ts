@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { t } from './i18n';
 import { copySettingsStripped, defaultDir, samePath, sameRealPath, syncMcpServers } from './paths';
+import { comparablePath, LinkPrivilegeError, copyLink, createLink, fileLinksAvailable, isWindows, pidAlive } from './platform';
 
 // Whole-entry links (kind: file needs an empty-file default, dir needs an empty dir)
 export const CLAUDE_SHARED_ENTRIES: ReadonlyArray<{ name: string; kind: 'file' | 'dir' }> = [
@@ -41,6 +42,8 @@ export interface ShareReport {
   created: string[];    // entries created empty in the default dir
   conflicts: string[];  // entries the account has as a real file/dir or a link elsewhere; left untouched
   refused: string[];    // entries refused for safety (e.g. 'settings.json' when the default has identity keys)
+  copied?: string[];    // config files copied once instead of linked (Windows without file-link privilege); they no longer follow the default
+  noPrivilege?: string[]; // single-file entries that could not be linked because Windows refuses file symlinks (Developer Mode off); left independent
   busy?: string[];      // entries whose repair would move or unlink account files, skipped because the account is busy (Claude only)
 }
 
@@ -77,7 +80,7 @@ export function linksTo(link: string, target: string): boolean {
   const st = lstatOrUndefined(link);
   if (!st?.isSymbolicLink()) return false;
   const to = path.resolve(path.dirname(link), fs.readlinkSync(link));
-  return to === path.resolve(target) || (fs.existsSync(link) && sameRealPath(link, target));
+  return comparablePath(to) === comparablePath(target) || (fs.existsSync(link) && sameRealPath(link, target));
 }
 
 function isDefault(dir: string): boolean {
@@ -118,17 +121,52 @@ function ensureDefaultEntry(target: string, kind: 'file' | 'dir'): boolean {
 }
 
 // Links link → target; 'linked' / 'ok' (already linked) / 'conflict' (real entry or link elsewhere, untouched)
-export function linkEntry(link: string, target: string): 'linked' | 'ok' | 'conflict' {
+export function linkEntry(link: string, target: string): 'linked' | 'ok' | 'conflict' | 'noprivilege' {
   const st = lstatOrUndefined(link);
   if (!st) {
-    fs.symlinkSync(target, link);
+    try {
+      createLink(target, link);
+    } catch (e) {
+      // Windows without Developer Mode: a file symlink is refused; the entry stays independent and the rest goes on
+      if (e instanceof LinkPrivilegeError) return 'noprivilege';
+      throw e;
+    }
     return 'linked';
   }
-  return linksTo(link, target) ? 'ok' : 'conflict';
+  if (linksTo(link, target)) return 'ok';
+  // Windows with file-link privilege now available: a copied config file identical to the default is upgraded to a real
+  // link (config files only: databases and locks may be open elsewhere)
+  if (isWindows() && COPYABLE_ON_NO_LINK.includes(path.basename(link)) && st.isFile() && fs.existsSync(target) && sameContent(link, target, st, fs.statSync(target)) && fileLinksAvailable(path.dirname(link))) {
+    fs.unlinkSync(link);
+    createLink(target, link);
+    return 'linked';
+  }
+  // Windows without file-link privilege: a real config file is the expected state (a copy the user agreed to)
+  if (isWindows() && COPYABLE_ON_NO_LINK.includes(path.basename(link)) && st.isFile() && !fileLinksAvailable(path.dirname(link))) return 'ok';
+  return 'conflict';
 }
 
-export function record(report: ShareReport, name: string, result: 'linked' | 'ok' | 'conflict'): void {
-  if (result === 'linked') report.linked.push(name);
+// Small configuration files that may be copied once when a link is refused. Never history, databases or locks:
+// a copy of those would silently diverge or corrupt
+export const COPYABLE_ON_NO_LINK: readonly string[] = ['settings.json', 'CLAUDE.md', 'config.toml', 'AGENTS.md', 'hooks.json'];
+
+/** Options of the linking operations. copyConfig: the user agreed to one-time copies where a file link is refused. */
+export interface LinkOptions { copyConfig?: boolean }
+
+/** record() plus the Windows fallback: a refused link of a copyable file becomes a one-time copy of the default file. */
+export function recordLink(report: ShareReport, name: string, result: ReturnType<typeof linkEntry>, link: string, target: string, allowCopy: boolean): void {
+  if (result === 'noprivilege' && allowCopy && COPYABLE_ON_NO_LINK.includes(name) && fs.existsSync(target) && fs.statSync(target).isFile() && !lstatOrUndefined(link)) {
+    fs.copyFileSync(target, link, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(link, 0o600);
+    (report.copied ??= []).push(name);
+    return;
+  }
+  record(report, name, result);
+}
+
+export function record(report: ShareReport, name: string, result: 'linked' | 'ok' | 'conflict' | 'noprivilege'): void {
+  if (result === 'noprivilege') (report.noPrivilege ??= []).push(name);
+  else if (result === 'linked') report.linked.push(name);
   else if (result === 'conflict') report.conflicts.push(name);
 }
 
@@ -157,7 +195,7 @@ export function mergeLines(src: string, dst: string): number {
  *  in a shared account a real history.jsonl (replaced by `claude project purge`) is merged back and relinked.
  *  Also removes links in skills/ or plugins/ whose default child no longer exists. Steps that move or unlink account
  *  files are skipped and reported under busy while claudeAccountBusy(dir, procRoot). dir === default → empty report. */
-export function ensureClaudeLinks(dir: string, procRoot = '/proc'): ShareReport {
+export function ensureClaudeLinks(dir: string, procRoot = '/proc', options: LinkOptions = {}): ShareReport {
   const report = emptyReport();
   if (isDefault(dir)) return report;
   const def = defaultDir();
@@ -170,6 +208,8 @@ export function ensureClaudeLinks(dir: string, procRoot = '/proc'): ShareReport 
   const isBusy = (): boolean => (busy ??= claudeAccountBusy(dir, procRoot));
 
   const shared = isSharedClaudeAccount(dir);
+  // Merging a file's lines back removes it; without file-link privilege it could not be linked again, so it stays
+  const fileLinks = fileLinksAvailable(acc);
   for (const { name, kind } of CLAUDE_SHARED_ENTRIES) {
     const target = path.join(def, name);
     if (name === 'settings.json' && !settingsShareable(target)) {
@@ -179,14 +219,14 @@ export function ensureClaudeLinks(dir: string, procRoot = '/proc'): ShareReport 
     if (ensureDefaultEntry(target, kind)) report.created.push(name);
     const link = path.join(acc, name);
     // `claude project purge` rewrites history.jsonl by rename, replacing the link: merge the lines back and relink
-    if (shared && name === 'history.jsonl' && lstatOrUndefined(link)?.isFile()) {
+    if (shared && name === 'history.jsonl' && lstatOrUndefined(link)?.isFile() && fileLinks) {
       if (isBusy()) {
         (report.busy ??= []).push(name);
         continue;
       }
       mergeLines(link, target);
     }
-    record(report, name, linkEntry(link, target));
+    recordLink(report, name, linkEntry(link, target), link, target, !!options.copyConfig);
   }
 
   for (const name of CLAUDE_CHILD_SHARED_DIRS) {
@@ -218,7 +258,7 @@ export function ensureClaudeLinks(dir: string, procRoot = '/proc'): ShareReport 
       const link = path.join(accFolder, child);
       if (!lstatOrUndefined(link)?.isSymbolicLink()) continue;
       const to = path.resolve(accFolder, fs.readlinkSync(link));
-      if (path.dirname(to) !== defFolder || lstatOrUndefined(to)) continue;
+      if (comparablePath(path.dirname(to)) !== comparablePath(defFolder) || lstatOrUndefined(to)) continue;
       if (isBusy()) (report.busy ??= []).push(`${name}/${child}`);
       else fs.unlinkSync(link);
     }
@@ -313,6 +353,17 @@ export function mirrorClaudeJson(fromJson: string, dir: string, beforeCommit?: (
   return { changed };
 }
 
+// pid of a live process recorded in a session file; undefined when unreadable, invalid or not running
+function sessionPid(file: string): number | undefined {
+  try {
+    const data: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const pid = isPlainObject(data) ? data.pid : undefined;
+    return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && pidAlive(pid) ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** true when a Claude process is running with this config dir: a <dir>/sessions/*.json whose pid is alive and whose
  *  /proc/<pid>/environ has CLAUDE_CONFIG_DIR=<dir> (for the default dir: unset or the default). Without procRoot
  *  (e.g. no /proc) a session file counts as busy. procRoot is for tests. */
@@ -324,6 +375,9 @@ export function claudeAccountBusy(dir: string, procRoot = '/proc'): boolean {
   } catch {
     return false;
   }
+  // Windows has no /proc and an environment cannot be read from another process: a live session pid in the
+  // account's own sessions folder counts as busy
+  if (isWindows() && procRoot === '/proc') return files.some((f) => sessionPid(path.join(sessions, f)) !== undefined);
   // A live session cannot be ruled out without procRoot
   if (files.length > 0 && !fs.existsSync(procRoot)) return true;
   const def = defaultDir();
@@ -363,7 +417,7 @@ export function moveEntry(src: string, dst: string): void {
   }
   const st = fs.lstatSync(src);
   if (st.isSymbolicLink()) {
-    fs.symlinkSync(fs.readlinkSync(src), dst);
+    copyLink(src, dst);
     fs.unlinkSync(src);
   } else if (st.isDirectory()) {
     copyTree(src, dst, 'throw');
@@ -384,7 +438,10 @@ export function freeName(base: string): string {
 
 export function sameContent(a: string, b: string, sa: fs.Stats, sb: fs.Stats): boolean {
   if (sa.isSymbolicLink() || sb.isSymbolicLink()) {
-    return sa.isSymbolicLink() && sb.isSymbolicLink() && fs.readlinkSync(a) === fs.readlinkSync(b);
+    if (!sa.isSymbolicLink() || !sb.isSymbolicLink()) return false;
+    const ra = fs.readlinkSync(a);
+    const rb = fs.readlinkSync(b);
+    return ra === rb || (isWindows() && comparablePath(ra) === comparablePath(rb));
   }
   return sa.isFile() && sb.isFile() && sa.size === sb.size && fs.readFileSync(a).equals(fs.readFileSync(b));
 }
@@ -452,7 +509,7 @@ function appendHistory(src: string, dst: string): void {
 
 /** Converts an independent account into a shared one (see the contract); ends with ensureClaudeLinks(dir, procRoot).
  *  Throws t('share.busy') with the display name label (defaults to accountName) when claudeAccountBusy(dir, procRoot). */
-export function migrateClaudeToShared(dir: string, accountName: string, procRoot = '/proc', label = accountName): MigrateReport {
+export function migrateClaudeToShared(dir: string, accountName: string, procRoot = '/proc', label = accountName, options: LinkOptions = {}): MigrateReport {
   const report: MigrateReport = { ...emptyReport(), moved: 0, duplicates: 0, keptBoth: [], backups: [] };
   if (isDefault(dir)) return report;
   if (claudeAccountBusy(dir, procRoot)) throw new Error(t('share.busy', { name: label }));
@@ -460,6 +517,9 @@ export function migrateClaudeToShared(dir: string, accountName: string, procRoot
   const acc = path.resolve(dir);
   fs.mkdirSync(def, { recursive: true, mode: 0o700 });
   const ctx: MergeCtx = { report, account: accountName };
+  // Without file-link privilege (Windows, Developer Mode off) single files are never moved into the default account:
+  // they could not be linked back, so the account keeps them
+  const fileLinks = fileLinksAvailable(acc);
 
   for (const { name, kind } of CLAUDE_SHARED_ENTRIES) {
     const src = path.join(acc, name);
@@ -471,6 +531,10 @@ export function migrateClaudeToShared(dir: string, accountName: string, procRoot
       const into = defaultFolder(dst);
       if (into) mergeEntry(src, into, name, ctx);
     } else if (st.isFile()) {
+      if (!fileLinks) {
+        (report.noPrivilege ??= []).push(name);
+        continue;
+      }
       if (name === 'history.jsonl') {
         appendHistory(src, dst);
         report.moved++;
@@ -506,16 +570,22 @@ export function migrateClaudeToShared(dir: string, accountName: string, procRoot
       if (excluded.has(child)) continue;
       const src = path.join(accFolder, child);
       if (linksTo(src, path.join(defFolder, child))) continue;
+      if (!fileLinks && lstatOrUndefined(src)?.isFile()) {
+        (report.noPrivilege ??= []).push(`${name}/${child}`);
+        continue;
+      }
       mergeEntry(src, path.join(into, child), `${name}/${child}`, ctx);
     }
   }
 
-  const links = ensureClaudeLinks(dir, procRoot);
+  const links = ensureClaudeLinks(dir, procRoot, options);
   report.linked.push(...links.linked);
   report.created.push(...links.created);
   report.conflicts.push(...links.conflicts);
   report.refused.push(...links.refused);
   if (links.busy) report.busy = [...links.busy];
+  if (links.copied) report.copied = [...links.copied];
+  if (links.noPrivilege) report.noPrivilege = [...new Set([...(report.noPrivilege ?? []), ...links.noPrivilege])];
   return report;
 }
 
@@ -534,7 +604,7 @@ export function copyTree(src: string, dst: string, existing: 'skip' | 'throw' = 
   } else if (ds) {
     existsError(dst, existing);
   } else if (st.isSymbolicLink()) {
-    fs.symlinkSync(fs.readlinkSync(src), dst);
+    copyLink(src, dst);
   } else if (st.isFile()) {
     fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL);
     fs.chmodSync(dst, st.mode & 0o777);

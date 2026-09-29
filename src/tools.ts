@@ -5,15 +5,17 @@ import { execFile } from 'node:child_process';
 import { currentDir, isExplicitConfigDir } from './claudeSettings';
 import { effectiveDir } from './codex/codexState';
 import { claudeJsonPath, defaultDir } from './paths';
-import { ensureClaudeLinks, isSharedClaudeAccount, mirrorClaudeJson } from './claudeShare';
+import { ensureClaudeLinks, isSharedClaudeAccount, mirrorClaudeJson, type LinkOptions } from './claudeShare';
+import { askCopyFallback } from './linkPolicy';
 import { describeShareReport, type ShareReportLike } from './shareReport';
 import type { PanelMode, ToolId } from './protocol';
 import { t } from './i18n';
+import { isWindows } from './platform';
 
 export interface ShareOps {
   isShared(dir: string): boolean;
   // Re-links the account and mirrors what the vendor mirrors; returns the report of the linking step
-  refresh(dir: string): ShareReportLike;
+  refresh(dir: string, options?: LinkOptions): ShareReportLike;
 }
 
 export interface ToolDeps {
@@ -65,12 +67,15 @@ export async function runTool(mode: PanelMode, tool: ToolId, deps: ToolDeps): Pr
       else await showCliVersions();
       return;
     case 'sync':
-      syncShared(mode, deps);
+      await syncShared(mode, deps);
       return;
     case 'updateCli': {
       const vendor = mode === 'claude' ? 'Claude' : 'Codex';
-      const terminal = vscode.window.createTerminal({ name: t('tools.updateCli', { vendor }) });
-      terminal.sendText(mode === 'claude' ? 'claude update' : 'env -u CODEX_HOME codex update');
+      const terminal = vscode.window.createTerminal({
+        name: t('tools.updateCli', { vendor }),
+        env: isWindows() && mode === 'codex' ? { CODEX_HOME: null } : undefined,
+      });
+      terminal.sendText(mode === 'claude' ? 'claude update' : isWindows() ? 'codex update' : 'env -u CODEX_HOME codex update');
       terminal.show();
       return;
     }
@@ -79,8 +84,8 @@ export async function runTool(mode: PanelMode, tool: ToolId, deps: ToolDeps): Pr
 
 const claudeShareOps: ShareOps = {
   isShared: isSharedClaudeAccount,
-  refresh(dir) {
-    const report = ensureClaudeLinks(dir);
+  refresh(dir, options) {
+    const report = ensureClaudeLinks(dir, '/proc', options);
     const def = defaultDir();
     mirrorClaudeJson(claudeJsonPath(def, isExplicitConfigDir(def)), dir);
     return report;
@@ -88,7 +93,7 @@ const claudeShareOps: ShareOps = {
 };
 
 // Re-links every shared account of the vendor to the default account and reports in one notification; independent accounts are untouched
-function syncShared(mode: PanelMode, deps: ToolDeps): void {
+async function syncShared(mode: PanelMode, deps: ToolDeps): Promise<void> {
   const vendor = mode === 'claude' ? 'Claude' : 'Codex';
   const dirs = mode === 'claude' ? deps.claudeDirs : deps.codexDirs;
   const ops = mode === 'claude' ? claudeShareOps : deps.codexShareOps;
@@ -107,10 +112,12 @@ function syncShared(mode: PanelMode, deps: ToolDeps): void {
     void vscode.window.showInformationMessage(t('sync.none', { vendor }));
     return;
   }
+  // One question for the whole run (Windows without file-link privilege only)
+  const options = await askCopyFallback(shared[0], mode === 'claude' ? 'Claude' : 'Codex');
   const issues: string[] = [];
   for (const dir of shared) {
     try {
-      const notes = describeShareReport(ops.refresh(dir));
+      const notes = describeShareReport(ops.refresh(dir, options));
       if (notes) issues.push(t('sync.item', { name: nameOf(dir), notes }));
     } catch (err) {
       issues.push(t('sync.item', { name: nameOf(dir), notes: errText(err) }));
@@ -159,7 +166,8 @@ function danglingLinkTarget(file: string): string | undefined {
 // Runs `<cmd> --version` read-only without a shell; shows "not found" when not installed, otherwise an error summary
 function cliVersion(cmd: string): Promise<string> {
   return new Promise((resolve) => {
-    execFile(cmd, ['--version'], { timeout: 8000 }, (err, stdout) => {
+    // Windows: npm installs .cmd shims that only a shell resolves; cmd is a fixed literal
+    execFile(cmd, ['--version'], { timeout: 8000, shell: isWindows(), windowsHide: true }, (err, stdout) => {
       if (err) {
         const e = err as NodeJS.ErrnoException & { killed?: boolean };
         if (e.code === 'ENOENT') return resolve(t('tools.ver.notFound'));

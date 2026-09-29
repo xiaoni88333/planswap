@@ -4,8 +4,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { t } from '../i18n';
 import { samePath, sameRealPath } from '../paths';
+import { comparablePath, fileLinksAvailable, imageRunning, isWindows } from '../platform';
 import {
-  type MergeCtx, type MigrateReport, type ShareReport, copyTree, defaultFolder, emptyReport, freeName, linkEntry,
+  type MergeCtx, type MigrateReport, type ShareReport, copyTree, defaultFolder, emptyReport, freeName, linkEntry, recordLink, type LinkOptions,
   linksTo, lstatOrUndefined, mergeEntry, mergeLines, moveEntry, realOrResolved, record, sameContent, unlinkChildLinks, unlinkIfLinksTo,
 } from '../claudeShare';
 import { blockedConfigReason, codexDaemonAlive, codexDefaultDir, copyCodexSeed } from './codexPaths';
@@ -120,12 +121,14 @@ export function isSharedCodexAccount(dir: string): boolean {
 /** Creates/repairs every link of a shared account (idempotent). Never touches the default dir's existing content.
  *  In a shared account a real history.jsonl / session_index.jsonl is merged back into the default file and relinked
  *  (reported under `linked`); a real sqlite db stays a conflict. dir === default → empty report. */
-export function ensureCodexLinks(dir: string): ShareReport {
+export function ensureCodexLinks(dir: string, options: LinkOptions = {}): ShareReport {
   const report = emptyReport();
   if (isDefault(dir)) return report;
   const def = codexDefaultDir();
   const acc = path.resolve(dir);
   const shared = isSharedCodexAccount(acc);
+  // Merging a file's lines back removes it; without file-link privilege it could not be linked again, so it stays
+  const fileLinks = fileLinksAvailable(acc);
   fs.mkdirSync(def, { recursive: true, mode: 0o700 });
   fs.mkdirSync(acc, { recursive: true, mode: 0o700 });
 
@@ -148,10 +151,10 @@ export function ensureCodexLinks(dir: string): ShareReport {
       if (ensureDefaultEntry(path.join(def, parent), 'dir')) report.created.push(parent);
     }
     if (kind !== 'link-only' && ensureDefaultEntry(target, kind)) report.created.push(name);
-    if (shared && JSONL_FILES.includes(name) && lstatOrUndefined(link)?.isFile()) {
+    if (shared && fileLinks && JSONL_FILES.includes(name) && lstatOrUndefined(link)?.isFile()) {
       mergeLines(link, target);
     }
-    record(report, name, linkEntry(link, target));
+    recordLink(report, name, linkEntry(link, target), link, target, !!options.copyConfig);
   }
 
   for (const { dir: rel, excludes } of CODEX_CHILD_SHARED_DIRS) {
@@ -172,7 +175,7 @@ export function ensureCodexLinks(dir: string): ShareReport {
       const link = path.join(accFolder, child);
       if (!lstatOrUndefined(link)?.isSymbolicLink()) continue;
       const to = path.resolve(accFolder, fs.readlinkSync(link));
-      if (path.dirname(to) === defFolder && !lstatOrUndefined(to)) fs.unlinkSync(link);
+      if (comparablePath(path.dirname(to)) === comparablePath(defFolder) && !lstatOrUndefined(to)) fs.unlinkSync(link);
     }
   }
   return report;
@@ -183,6 +186,8 @@ export function ensureCodexLinks(dir: string): ShareReport {
  *  Unreadable /proc entries are skipped; an unreadable procRoot counts as busy. procRoot is for tests. */
 export function codexAccountBusy(dir: string, procRoot = '/proc'): boolean {
   if (codexDaemonAlive(path.resolve(dir))) return true;
+  // Windows has no /proc and cannot read another process's environment: any running codex.exe counts as busy
+  if (isWindows() && procRoot === '/proc') return imageRunning('codex.exe');
   let pids: string[];
   try {
     pids = fs.readdirSync(procRoot).filter((p) => /^\d+$/.test(p));
@@ -227,7 +232,7 @@ function backupSqlite(src: string, rel: string, report: MigrateReport): void {
 
 /** Converts an independent account into a shared one (see the contract); ends with ensureCodexLinks(dir).
  *  Throws t('share.busyCodex') when codexAccountBusy(dir, procRoot). */
-export function migrateCodexToShared(dir: string, accountName: string, procRoot = '/proc'): MigrateReport {
+export function migrateCodexToShared(dir: string, accountName: string, procRoot = '/proc', options: LinkOptions = {}): MigrateReport {
   const report: MigrateReport = { ...emptyReport(), moved: 0, duplicates: 0, keptBoth: [], backups: [] };
   if (isDefault(dir)) return report;
   if (codexAccountBusy(dir, procRoot)) throw new Error(t('share.busyCodex', { name: accountName }));
@@ -235,6 +240,8 @@ export function migrateCodexToShared(dir: string, accountName: string, procRoot 
   const acc = path.resolve(dir);
   fs.mkdirSync(def, { recursive: true, mode: 0o700 });
   const ctx: MergeCtx = { report, account: accountName };
+  // Without file-link privilege (Windows, Developer Mode off) single files stay in the account, see migrateClaudeToShared
+  const fileLinks = fileLinksAvailable(acc);
 
   for (const { name, kind } of CODEX_SHARED_ENTRIES) {
     const parent = path.dirname(name);
@@ -250,6 +257,8 @@ export function migrateCodexToShared(dir: string, accountName: string, procRoot 
       if (into) mergeEntry(src, into, name, ctx);
     } else if (!st.isFile()) {
       continue;
+    } else if (!fileLinks) {
+      (report.noPrivilege ??= []).push(name);
     } else if (JSONL_FILES.includes(name)) {
       if (mergeLines(src, dst) > 0) report.moved++;
     } else if (name.endsWith('.sqlite')) {
@@ -287,15 +296,21 @@ export function migrateCodexToShared(dir: string, accountName: string, procRoot 
       if (excluded.has(child)) continue;
       const src = path.join(accFolder, child);
       if (linksTo(src, path.join(defFolder, child))) continue;
+      if (!fileLinks && lstatOrUndefined(src)?.isFile()) {
+        (report.noPrivilege ??= []).push(`${rel}/${child}`);
+        continue;
+      }
       mergeEntry(src, path.join(into, child), `${rel}/${child}`, ctx);
     }
   }
 
-  const links = ensureCodexLinks(dir);
+  const links = ensureCodexLinks(dir, options);
   report.linked.push(...links.linked);
   report.created.push(...links.created);
   report.conflicts.push(...links.conflicts);
   report.refused.push(...links.refused);
+  if (links.copied) report.copied = [...links.copied];
+  if (links.noPrivilege) report.noPrivilege = [...new Set([...(report.noPrivilege ?? []), ...links.noPrivilege])];
   return report;
 }
 

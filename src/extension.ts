@@ -12,6 +12,7 @@ import { CodexAccountStore } from './codex/codexStore';
 import { codexPanelSource, registerCodexCommands, restartServerInteractive } from './codex/codexCommands';
 import { registerToolCommands, runTool, type ToolDeps } from './tools';
 import { setLocale, t } from './i18n';
+import { isSupportedPlatform } from './platform';
 import { migrateLegacyLanguage, resolveLocale, watchLocale } from './i18nVscode';
 import { migrateLegacyCodex } from './codex/codexState';
 
@@ -21,11 +22,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   // Resolve the UI locale before anything renders (a language set under the pre-rename key is carried over once)
   await migrateLegacyLanguage(ctx.globalState);
   setLocale(resolveLocale());
-  if (process.platform !== 'linux') {
+  if (!isSupportedPlatform()) {
     void vscode.window.showWarningMessage(t('ext.linuxOnly'));
     return;
   }
-  // Account lists, ignore lists and aliases live in ~/.config/planswap/state.json so they follow the WSL distribution;
+  // Account lists, ignore lists and aliases live in ~/.config/planswap/state.json so they follow the WSL distribution (or the Windows user profile);
   // globalState is stored on the client and would be shared by every distro. Existing globalState data is imported once
   const state = new FileMemento();
   await state.importOnce(ctx.globalState);
@@ -63,7 +64,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     postVersions: (items) => panel.post({ type: 'versions', items }),
     claudeDirs: () => store.named().map((a) => a.dir),
     codexDirs: codex ? () => codex.store.named().map((a) => a.dir) : undefined,
-    codexShareOps: codex ? { isShared: isSharedCodexAccount, refresh: ensureCodexLinks } : undefined,
+    codexShareOps: codex ? { isShared: isSharedCodexAccount, refresh: (dir, options) => ensureCodexLinks(dir, options) } : undefined,
     labelOf: (mode, dir) => {
       const account = mode === 'claude' ? store.findByDir(dir) : codex?.store.findByDir(dir);
       return account ? labelFor(account.name, mode === 'claude' ? claudeLabels : codexLabels) : path.basename(dir);
